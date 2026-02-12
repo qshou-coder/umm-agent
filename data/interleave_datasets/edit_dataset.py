@@ -4,9 +4,23 @@
 import io
 import random
 from PIL import Image, ImageFile, PngImagePlugin
+from ..debug_trace import agent_log
 
+
+# region agent log
+agent_log("H6", "data/interleave_datasets/edit_dataset.py:imports", "before import interleave_t2i_dataset")
+# endregion
 from .interleave_t2i_dataset import InterleavedBaseIterableDataset, ParquetStandardIterableDataset
+# region agent log
+agent_log("H6", "data/interleave_datasets/edit_dataset.py:imports", "after import interleave_t2i_dataset")
+# endregion
+# region agent log
+agent_log("H6", "data/interleave_datasets/edit_dataset.py:imports", "before import data_utils")
+# endregion
 from ..data_utils import pil_img2rgb
+# region agent log
+agent_log("H6", "data/interleave_datasets/edit_dataset.py:imports", "after import data_utils")
+# endregion
 
 
 Image.MAX_IMAGE_PIXELS = 200000000

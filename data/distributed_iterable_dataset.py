@@ -3,7 +3,16 @@
 
 import json
 import random
+from .debug_trace import agent_log
+
+
+# region agent log
+agent_log("H8", "data/distributed_iterable_dataset.py:imports", "before import torch")
+# endregion
 import torch
+# region agent log
+agent_log("H8", "data/distributed_iterable_dataset.py:imports", "after import torch")
+# endregion
 
 
 class DistributedIterableDataset(torch.utils.data.IterableDataset):
@@ -14,6 +23,9 @@ class DistributedIterableDataset(torch.utils.data.IterableDataset):
         self.num_workers = num_workers
         self.rng = random.Random()
         self.data_paths = None
+        # Some datasets may already shard data by global rank before set_epoch().
+        # In that case we should only shuffle locally, and skip rank-level split.
+        self.data_already_sharded = False
 
     def get_data_paths(self, *args, **kwargs):
         raise NotImplementedError
@@ -52,9 +64,12 @@ class DistributedIterableDataset(torch.utils.data.IterableDataset):
         self.rng.seed(seed)
         self.rng.shuffle(data_paths)
 
-        num_files_per_rank = len(data_paths) // self.world_size
-        local_start = self.local_rank * num_files_per_rank
-        local_end = (self.local_rank + 1) * num_files_per_rank
+        split_world_size = 1 if self.data_already_sharded else self.world_size
+        split_rank = 0 if self.data_already_sharded else self.local_rank
+
+        num_files_per_rank = len(data_paths) // split_world_size
+        local_start = split_rank * num_files_per_rank
+        local_end = (split_rank + 1) * num_files_per_rank
         self.num_files_per_rank = num_files_per_rank
         self.data_paths_per_rank = data_paths[local_start:local_end]
 

@@ -7,17 +7,43 @@ import json
 
 import numpy as np
 import torch
+from .debug_trace import import_with_log
 
-from .data_utils import (
-    get_flattened_position_ids_interpolate,
-    get_flattened_position_ids_extrapolate, 
-    len2weight,
-    patchify, 
-    prepare_attention_mask_per_sample, 
+_data_utils = import_with_log(
+    "data.data_utils",
+    "H1",
+    "data/dataset_base.py:imports",
+    "before import data.data_utils",
 )
-from .dataset_info import DATASET_INFO, DATASET_REGISTRY
-from .transforms import ImageTransform
-from .video_utils import FrameSampler
+get_flattened_position_ids_interpolate = _data_utils.get_flattened_position_ids_interpolate
+get_flattened_position_ids_extrapolate = _data_utils.get_flattened_position_ids_extrapolate
+len2weight = _data_utils.len2weight
+patchify = _data_utils.patchify
+prepare_attention_mask_per_sample = _data_utils.prepare_attention_mask_per_sample
+
+_dataset_info = import_with_log(
+    "data.dataset_info",
+    "H1",
+    "data/dataset_base.py:imports",
+    "before import data.dataset_info",
+)
+DATASET_INFO = _dataset_info.DATASET_INFO
+get_dataset_class = _dataset_info.get_dataset_class
+
+_transforms = import_with_log(
+    "data.transforms",
+    "H1",
+    "data/dataset_base.py:imports",
+    "before import data.transforms/video_utils",
+)
+ImageTransform = _transforms.ImageTransform
+_video_utils = import_with_log(
+    "data.video_utils",
+    "H1",
+    "data/dataset_base.py:imports",
+    "before import data.transforms/video_utils",
+)
+FrameSampler = _video_utils.FrameSampler
 
 
 class DataConfig:
@@ -152,7 +178,8 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 data_status_per_group = data_status[grouped_dataset_name]
             else:
                 data_status_per_group = None
-            dataset = DATASET_REGISTRY[grouped_dataset_name](
+            dataset_cls = get_dataset_class(grouped_dataset_name)
+            dataset = dataset_cls(
                 dataset_name=grouped_dataset_name,
                 tokenizer=self.tokenizer,
                 local_rank=self.local_rank,

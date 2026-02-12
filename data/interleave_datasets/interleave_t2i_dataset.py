@@ -1,10 +1,26 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
 
-import pyarrow.parquet as pq
+import importlib
+from ..debug_trace import agent_log
 
+
+pq = importlib.import_module("pyarrow.parquet")
+
+# region agent log
+agent_log("H8", "data/interleave_datasets/interleave_t2i_dataset.py:imports", "before import distributed_iterable_dataset")
+# endregion
 from ..distributed_iterable_dataset import DistributedIterableDataset
+# region agent log
+agent_log("H8", "data/interleave_datasets/interleave_t2i_dataset.py:imports", "after import distributed_iterable_dataset")
+# endregion
+# region agent log
+agent_log("H9", "data/interleave_datasets/interleave_t2i_dataset.py:imports", "before import parquet_utils")
+# endregion
 from ..parquet_utils import get_parquet_data_paths, init_arrow_pf_fs
+# region agent log
+agent_log("H9", "data/interleave_datasets/interleave_t2i_dataset.py:imports", "after import parquet_utils")
+# endregion
 
 
 class InterleavedBaseIterableDataset(DistributedIterableDataset):

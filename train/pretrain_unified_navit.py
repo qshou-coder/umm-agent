@@ -5,12 +5,18 @@ import functools
 import gc
 import json
 import os
+import socket
+import signal
+import importlib
+from itertools import chain
 import wandb
 import yaml
 from copy import deepcopy
 from dataclasses import dataclass, field
 from time import time
 from typing import Optional
+
+print("[debug-train-import] stdlib imports done", flush=True)
 
 import torch
 import torch.distributed as dist
@@ -26,18 +32,249 @@ from transformers.optimization import (
     get_cosine_with_min_lr_schedule_with_warmup,
 )
 
-from data.dataset_base import DataConfig, PackedDataset, collate_wrapper
-from data.data_utils import add_special_tokens
-from modeling.autoencoder import load_ae
-from modeling.bagel import (
-    BagelConfig, Bagel, Qwen2Config, Qwen2ForCausalLM, SiglipVisionConfig, SiglipVisionModel
+print("[debug-train-import] torch/transformers imports done", flush=True)
+
+_debug_trace = importlib.import_module("data.debug_trace")
+_agent_log = _debug_trace.agent_log
+_import_with_log = _debug_trace.import_with_log
+
+
+_dataset_base = _import_with_log(
+    "data.dataset_base",
+    "H1",
+    "train/pretrain_unified_navit.py:project-imports",
+    "before import data.dataset_base",
 )
-from modeling.qwen2 import Qwen2Tokenizer
-from train.train_utils import create_logger, get_latest_ckpt
-from train.fsdp_utils import (
-    FSDPCheckpoint, FSDPConfig, grad_checkpoint_check_fn, fsdp_wrapper, 
-    fsdp_ema_setup, fsdp_ema_update,
+DataConfig = _dataset_base.DataConfig
+PackedDataset = _dataset_base.PackedDataset
+collate_wrapper = _dataset_base.collate_wrapper
+
+_data_utils = _import_with_log(
+    "data.data_utils",
+    "H2",
+    "train/pretrain_unified_navit.py:project-imports",
+    "before import data.data_utils",
 )
+add_special_tokens = _data_utils.add_special_tokens
+
+_autoencoder = _import_with_log(
+    "modeling.autoencoder",
+    "H3",
+    "train/pretrain_unified_navit.py:project-imports",
+    "before import modeling.autoencoder",
+)
+load_ae = _autoencoder.load_ae
+
+_bagel = _import_with_log(
+    "modeling.bagel",
+    "H4",
+    "train/pretrain_unified_navit.py:project-imports",
+    "before import modeling.bagel",
+)
+BagelConfig = _bagel.BagelConfig
+Bagel = _bagel.Bagel
+Qwen2Config = _bagel.Qwen2Config
+Qwen2ForCausalLM = _bagel.Qwen2ForCausalLM
+SiglipVisionConfig = _bagel.SiglipVisionConfig
+SiglipVisionModel = _bagel.SiglipVisionModel
+
+_qwen2 = _import_with_log(
+    "modeling.qwen2",
+    "H5",
+    "train/pretrain_unified_navit.py:project-imports",
+    "before import remaining project modules",
+)
+Qwen2Tokenizer = _qwen2.Qwen2Tokenizer
+_train_utils = importlib.import_module("train.train_utils")
+create_logger = _train_utils.create_logger
+get_latest_ckpt = _train_utils.get_latest_ckpt
+_fsdp_utils = importlib.import_module("train.fsdp_utils")
+FSDPCheckpoint = _fsdp_utils.FSDPCheckpoint
+FSDPConfig = _fsdp_utils.FSDPConfig
+grad_checkpoint_check_fn = _fsdp_utils.grad_checkpoint_check_fn
+fsdp_wrapper = _fsdp_utils.fsdp_wrapper
+fsdp_ema_setup = _fsdp_utils.fsdp_ema_setup
+fsdp_ema_update = _fsdp_utils.fsdp_ema_update
+
+# region agent log
+_agent_log("H0", "train/pretrain_unified_navit.py:project-imports", "project imports done")
+# endregion
+
+print("[debug-train-import] project imports done", flush=True)
+
+
+_ACTIVE_TRAIN_LOADER_ITER = None
+
+
+def _dbg(msg: str):
+    print(f"[debug-train] {msg}", flush=True)
+
+
+def _local_rank() -> int:
+    try:
+        return int(os.environ.get("LOCAL_RANK", "0"))
+    except ValueError:
+        return 0
+
+
+def _is_node_leader() -> bool:
+    return _local_rank() == 0
+
+
+def _stage_enter(stage_name: str, logger=None):
+    """Log stage entry once per node to avoid log storms on large clusters."""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    msg = (
+        f"[stage-enter] stage={stage_name} rank={rank}/{world_size} "
+        f"host={socket.gethostname()} local_rank={_local_rank()}"
+    )
+    if _is_node_leader() or world_size <= 16:
+        _dbg(msg)
+        if logger is not None:
+            logger.info(msg)
+    # region agent log
+    _agent_log(
+        "SYNC",
+        "train/pretrain_unified_navit.py:stage-enter",
+        msg,
+        {
+            "stage": stage_name,
+            "rank": rank,
+            "world_size": world_size,
+            "host": socket.gethostname(),
+            "local_rank": _local_rank(),
+        },
+    )
+    # endregion
+
+
+def _sync_stage(stage_name: str, logger=None, local_elapsed_sec: Optional[float] = None, topk: int = 8):
+    """Synchronize all ranks and print rank0 summary for straggler diagnosis."""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    wait_start = time()
+    dist.barrier()
+    wait_sec = time() - wait_start
+    msg = (
+        f"[stage-sync] stage={stage_name} rank={rank}/{world_size} "
+        f"wait_sec={wait_sec:.3f} local_elapsed_sec="
+        f"{(local_elapsed_sec if local_elapsed_sec is not None else -1.0):.3f}"
+    )
+    if _is_node_leader() or world_size <= 16:
+        _dbg(msg)
+        if logger is not None:
+            logger.info(msg)
+
+    records = [None for _ in range(world_size)]
+    dist.all_gather_object(
+        records,
+        {
+            "rank": rank,
+            "host": socket.gethostname(),
+            "local_rank": _local_rank(),
+            "wait_sec": float(wait_sec),
+            "local_elapsed_sec": (float(local_elapsed_sec) if local_elapsed_sec is not None else None),
+        },
+    )
+
+    if rank == 0:
+        wait_values = sorted(float(r["wait_sec"]) for r in records if r is not None)
+        idx95 = min(len(wait_values) - 1, int(len(wait_values) * 0.95))
+        summary_msg = (
+            f"[stage-sync-summary] stage={stage_name} world={world_size} "
+            f"wait_sec(min/p95/max)="
+            f"{wait_values[0]:.3f}/{wait_values[idx95]:.3f}/{wait_values[-1]:.3f}"
+        )
+        _dbg(summary_msg)
+        if logger is not None:
+            logger.info(summary_msg)
+
+        elapsed_records = [r for r in records if r is not None and r["local_elapsed_sec"] is not None]
+        if elapsed_records:
+            elapsed_sorted = sorted(float(r["local_elapsed_sec"]) for r in elapsed_records)
+            eidx95 = min(len(elapsed_sorted) - 1, int(len(elapsed_sorted) * 0.95))
+            elapsed_summary_msg = (
+                f"[stage-sync-summary] stage={stage_name} local_elapsed_sec(min/p95/max)="
+                f"{elapsed_sorted[0]:.3f}/{elapsed_sorted[eidx95]:.3f}/{elapsed_sorted[-1]:.3f}"
+            )
+            _dbg(elapsed_summary_msg)
+            if logger is not None:
+                logger.info(elapsed_summary_msg)
+
+            top_slow = sorted(
+                elapsed_records, key=lambda x: float(x["local_elapsed_sec"]), reverse=True
+            )[: max(1, min(topk, len(elapsed_records)))]
+            for rec in top_slow:
+                slow_msg = (
+                    f"[stage-sync-top] stage={stage_name} rank={rec['rank']} "
+                    f"host={rec['host']} local_rank={rec['local_rank']} "
+                    f"local_elapsed_sec={float(rec['local_elapsed_sec']):.3f} "
+                    f"wait_sec={float(rec['wait_sec']):.3f}"
+                )
+                _dbg(slow_msg)
+                if logger is not None:
+                    logger.info(slow_msg)
+    # region agent log
+    _agent_log(
+        "SYNC",
+        "train/pretrain_unified_navit.py:stage-sync",
+        msg,
+        {
+            "stage": stage_name,
+            "rank": rank,
+            "world_size": world_size,
+            "host": socket.gethostname(),
+            "local_rank": _local_rank(),
+            "wait_sec": round(wait_sec, 3),
+            "local_elapsed_sec": (round(local_elapsed_sec, 3) if local_elapsed_sec is not None else None),
+        },
+    )
+    # endregion
+
+
+def _shutdown_dataloader_workers(logger=None):
+    """Best-effort worker shutdown to avoid orphan dataloader processes."""
+    global _ACTIVE_TRAIN_LOADER_ITER
+    it = _ACTIVE_TRAIN_LOADER_ITER
+    if it is None:
+        return
+    try:
+        if hasattr(it, "_shutdown_workers"):
+            it._shutdown_workers()
+            _dbg("[cleanup] dataloader workers shut down")
+            if logger is not None:
+                logger.info("[cleanup] dataloader workers shut down")
+    except Exception as e:
+        _dbg(f"[cleanup] dataloader worker shutdown failed: {e}")
+        if logger is not None:
+            logger.warning(f"[cleanup] dataloader worker shutdown failed: {e}")
+    finally:
+        _ACTIVE_TRAIN_LOADER_ITER = None
+
+
+def _cleanup_runtime(logger=None):
+    _shutdown_dataloader_workers(logger)
+    if dist.is_available() and dist.is_initialized():
+        try:
+            dist.destroy_process_group()
+            _dbg("[cleanup] process group destroyed")
+            if logger is not None:
+                logger.info("[cleanup] process group destroyed")
+        except Exception as e:
+            _dbg(f"[cleanup] destroy_process_group failed: {e}")
+            if logger is not None:
+                logger.warning(f"[cleanup] destroy_process_group failed: {e}")
+
+
+def _install_termination_handlers(logger=None):
+    def _handle_signal(signum, _frame):
+        _dbg(f"[cleanup] received signal={signum}, start cleanup")
+        _cleanup_runtime(logger)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
 
 
 def count_parameters(module: torch.nn.Module) -> int:
@@ -254,6 +491,22 @@ class DataArguments:
     num_workers: int = field(
         default=4,
         metadata={"help": "Number of background workers for the PyTorch DataLoader."}
+    )
+    pin_memory: bool = field(
+        default=False,
+        metadata={"help": "Pin CPU memory for faster H2D copy; disable for stability when debugging large clusters."}
+    )
+    persistent_workers: bool = field(
+        default=False,
+        metadata={"help": "Keep DataLoader workers alive across iterations; disable to reduce stale worker risk."}
+    )
+    dataloader_timeout_sec: int = field(
+        default=0,
+        metadata={"help": "DataLoader timeout in seconds. 0 means wait forever."}
+    )
+    multiprocessing_context: Optional[str] = field(
+        default="spawn",
+        metadata={"help": "DataLoader worker start method: spawn/fork/forkserver. Use empty to keep PyTorch default."}
     )
     max_num_tokens_per_sample: int = field(
         default=16384,
@@ -495,12 +748,17 @@ class TrainingArguments:
 
 
 def main():
+    _dbg("entered main()")
     assert torch.cuda.is_available()
+    _dbg("before dist.init_process_group")
     dist.init_process_group("nccl")
+    _dbg(f"dist.init_process_group done, rank={dist.get_rank()}, world_size={dist.get_world_size()}")
     device = dist.get_rank() % torch.cuda.device_count()
     torch.cuda.set_device(device)
+    _dbg(f"cuda device set to {device}")
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    _dbg("arguments parsed")
     if training_args.peak_device_tflops <= 0:
         auto_tflops = detect_peak_tflops(training_args.peak_device_tflops)
         if auto_tflops > 0:
@@ -534,7 +792,8 @@ def main():
             logger.warning("Peak device TFLOPs not set or auto-detected; MFU will report 0.")
     else:
         logger = create_logger(None, dist.get_rank())
-    dist.barrier()
+    _install_termination_handlers(logger)
+    _sync_stage("post_logger_setup", logger)
     logger.info(f'Training arguments {training_args}')
     logger.info(f'Model arguments {model_args}')
     logger.info(f'Data arguments {data_args}')
@@ -565,22 +824,88 @@ def main():
     set_seed(seed)
 
     # Setup model:
+    _stage_enter("model_setup", logger)
+    model_build_t0 = time()
+    # region agent log
+    _agent_log(
+        "H11",
+        "train/pretrain_unified_navit.py:model-build",
+        "model construction start",
+        {"rank": dist.get_rank(), "world_size": dist.get_world_size()},
+    )
+    # endregion
     if training_args.finetune_from_hf:
+        # region agent log
+        _agent_log(
+            "H11",
+            "train/pretrain_unified_navit.py:model-build",
+            "before load llm_config from json",
+            {"rank": dist.get_rank(), "model_path": model_args.model_path},
+        )
+        # endregion
         llm_config = Qwen2Config.from_json_file(os.path.join(model_args.model_path, "llm_config.json"))
     else:
+        # region agent log
+        _agent_log(
+            "H11",
+            "train/pretrain_unified_navit.py:model-build",
+            "before load llm_config from pretrained",
+            {"rank": dist.get_rank(), "llm_path": model_args.llm_path},
+        )
+        # endregion
         llm_config = Qwen2Config.from_pretrained(model_args.llm_path)
     llm_config.layer_module = model_args.layer_module
     llm_config.qk_norm = model_args.llm_qk_norm
     llm_config.tie_word_embeddings = model_args.tie_word_embeddings
     llm_config.freeze_und = training_args.freeze_und
+    # region agent log
+    _agent_log(
+        "H11",
+        "train/pretrain_unified_navit.py:model-build",
+        "before build language model",
+        {"rank": dist.get_rank(), "finetune_from_hf": training_args.finetune_from_hf},
+    )
+    # endregion
     if training_args.finetune_from_hf:
         language_model = Qwen2ForCausalLM(llm_config)
     else:
         language_model = Qwen2ForCausalLM.from_pretrained(model_args.llm_path, config=llm_config)
+    # region agent log
+    _agent_log(
+        "H11",
+        "train/pretrain_unified_navit.py:model-build",
+        "after build language model",
+        {"rank": dist.get_rank(), "elapsed_sec": round(time() - model_build_t0, 3)},
+    )
+    # endregion
     if training_args.copy_init_moe:
+        # region agent log
+        _agent_log(
+            "H11",
+            "train/pretrain_unified_navit.py:model-build",
+            "before language_model.init_moe",
+            {"rank": dist.get_rank()},
+        )
+        # endregion
         language_model.init_moe()
+        # region agent log
+        _agent_log(
+            "H11",
+            "train/pretrain_unified_navit.py:model-build",
+            "after language_model.init_moe",
+            {"rank": dist.get_rank(), "elapsed_sec": round(time() - model_build_t0, 3)},
+        )
+        # endregion
 
     if training_args.visual_und:  
+        # region agent log
+        _agent_log(
+            "H11",
+            "train/pretrain_unified_navit.py:model-build",
+            "before build vit model",
+            {"rank": dist.get_rank(), "finetune_from_hf": training_args.finetune_from_hf},
+        )
+        # endregion
         if training_args.finetune_from_hf:
             vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_args.model_path, "vit_config.json"))
         else:
@@ -591,12 +916,36 @@ def main():
             vit_model = SiglipVisionModel(vit_config)
         else:
             vit_model = SiglipVisionModel.from_pretrained(model_args.vit_path, config=vit_config)
+        # region agent log
+        _agent_log(
+            "H11",
+            "train/pretrain_unified_navit.py:model-build",
+            "after build vit model",
+            {"rank": dist.get_rank(), "elapsed_sec": round(time() - model_build_t0, 3)},
+        )
+        # endregion
 
     if training_args.visual_gen:
+        # region agent log
+        _agent_log(
+            "H11",
+            "train/pretrain_unified_navit.py:model-build",
+            "before load vae",
+            {"rank": dist.get_rank(), "finetune_from_hf": training_args.finetune_from_hf},
+        )
+        # endregion
         vae_model, vae_config = load_ae(
             local_path=os.path.join(model_args.model_path, "ae.safetensors") 
             if training_args.finetune_from_hf else model_args.vae_path
         )
+        # region agent log
+        _agent_log(
+            "H11",
+            "train/pretrain_unified_navit.py:model-build",
+            "after load vae",
+            {"rank": dist.get_rank(), "elapsed_sec": round(time() - model_build_t0, 3)},
+        )
+        # endregion
 
     config = BagelConfig(
         visual_gen=training_args.visual_gen,
@@ -616,6 +965,14 @@ def main():
         vit_model if training_args.visual_und else None, 
         config
     )
+    # region agent log
+    _agent_log(
+        "H11",
+        "train/pretrain_unified_navit.py:model-build",
+        "after build Bagel wrapper",
+        {"rank": dist.get_rank(), "elapsed_sec": round(time() - model_build_t0, 3)},
+    )
+    # endregion
 
     if training_args.visual_und:
         model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config)
@@ -625,6 +982,7 @@ def main():
     logger.info(f"Model parameter count: {total_param_count / 1e9:.2f}B (LM-only: {lm_param_count / 1e9:.2f}B)")
 
     # Setup tokenizer for model:
+    _dbg(f"rank {dist.get_rank()} start tokenizer setup")
     tokenizer = Qwen2Tokenizer.from_pretrained(model_args.model_path if training_args.finetune_from_hf else model_args.llm_path)
     tokenizer, new_token_ids, num_new_tokens = add_special_tokens(tokenizer)
     if num_new_tokens > 0:
@@ -703,7 +1061,11 @@ def main():
             resume_from, optimizer, scheduler, fsdp_config, 
         )
 
+    _sync_stage("post_model_setup", logger, local_elapsed_sec=time() - model_build_t0, topk=16)
+
     # Setup packed dataloader
+    _stage_enter("dataloader_setup", logger)
+    dataloader_setup_t0 = time()
     with open(data_args.dataset_config_file, "r") as stream:
         dataset_meta = yaml.safe_load(stream)
     dataset_config = DataConfig(grouped_datasets=dataset_meta)
@@ -734,14 +1096,26 @@ def main():
         data_status=data_status,
     )
     train_dataset.set_epoch(data_args.data_seed)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=1, # batch size is 1 packed dataset
+    dataloader_kwargs = dict(
+        dataset=train_dataset,
+        batch_size=1,  # batch size is 1 packed dataset
         num_workers=data_args.num_workers,
-        pin_memory=True,
+        pin_memory=data_args.pin_memory,
         collate_fn=collate_wrapper(),
         drop_last=True,
-        prefetch_factor=data_args.prefetch_factor,
+        timeout=max(0, data_args.dataloader_timeout_sec),
+    )
+    if data_args.num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = data_args.prefetch_factor
+        dataloader_kwargs["persistent_workers"] = data_args.persistent_workers
+        if data_args.multiprocessing_context:
+            dataloader_kwargs["multiprocessing_context"] = data_args.multiprocessing_context
+    train_loader = DataLoader(**dataloader_kwargs)
+    _sync_stage(
+        "post_dataloader_setup",
+        logger,
+        local_elapsed_sec=time() - dataloader_setup_t0,
+        topk=16,
     )
 
     # Prepare models for training:
@@ -758,7 +1132,14 @@ def main():
     token_window = 0.0
     seqlen_square_window = 0.0
     dense_token_factor, attn_factor = qwen2_flop_coefficients(model.language_model.config)
-    for micro_step, data in enumerate(train_loader):
+    train_loader_iter = iter(train_loader)
+    global _ACTIVE_TRAIN_LOADER_ITER
+    _ACTIVE_TRAIN_LOADER_ITER = train_loader_iter
+    first_batch = next(train_loader_iter)
+    _dbg(f"rank {dist.get_rank()} first batch fetched from dataloader")
+    for micro_step, data in enumerate(chain([first_batch], train_loader_iter)):
+        if micro_step == 0:
+            _dbg(f"rank {dist.get_rank()} entered training loop step0")
         curr_step = train_step + micro_step // training_args.gradient_accumulation_steps
         if curr_step >= training_args.total_steps:
             logger.info(f"Reached total_steps={training_args.total_steps}, stopping training.")
@@ -787,8 +1168,10 @@ def main():
         if data['sample_lens']:
             sample_lens_tensor = torch.tensor(data['sample_lens'], dtype=torch.float32, device=device)
             sample_square = torch.dot(sample_lens_tensor, sample_lens_tensor)
-            dist.all_reduce(sample_square, op=dist.ReduceOp.SUM)
-            seqlen_square_window += sample_square.item()
+        else:
+            sample_square = torch.tensor(0.0, dtype=torch.float32, device=device)
+        dist.all_reduce(sample_square, op=dist.ReduceOp.SUM)
+        seqlen_square_window += sample_square.item()
 
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
             if training_args.visual_gen:
@@ -979,8 +1362,9 @@ def main():
     logger.info("Done!")
     if dist.get_rank() == 0 and use_wandb:
         wandb.finish()
-    dist.destroy_process_group()
+    _cleanup_runtime(logger)
 
 
 if __name__ == "__main__":
+    _dbg("python entry reached (__main__)")
     main()

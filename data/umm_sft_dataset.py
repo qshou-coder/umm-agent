@@ -2,6 +2,7 @@
 import json
 import os
 import traceback
+import hashlib
 from pathlib import Path
 from PIL import Image
 from .data_utils import pil_img2rgb
@@ -143,10 +144,6 @@ class SftAgenticIterableDataset(DistributedIterableDataset):
                             })
                 
                 filtered_item["conversations"] = standard_conversations
-                os.makedirs(f"data/test_dataloader_outputs/{item['ip_index']}", exist_ok=True)
-                with open(f"data/test_dataloader_outputs/{item['ip_index']}/filtered_item.json", "w", encoding="utf-8") as f:
-                    json.dump(filtered_item, f, ensure_ascii=False, indent=4)
-                    f.write("\n")
                 data_paths.append((filtered_item, ref_dir, gen_dir))
         return data_paths
     
@@ -226,12 +223,7 @@ class SftAgenticIterableDataset(DistributedIterableDataset):
                         gen_images = [pil_img2rgb(Image.open(img)) for img in gen_list]
                     except Exception as e:
                         print(f"Image load error for {ip_index}: {e}")
-                        continue
-
-                    for idx, img in enumerate(ref_images):
-                        img.save(f"data/test_dataloader_outputs/{ip_index}/ref_image_{idx}.jpg")
-                    for img in gen_images:
-                        img.save(f"data/test_dataloader_outputs/{ip_index}/gen_image.jpg")
+                        continue                    
                     
                     elements = self.change_format(data_item, ref_images, gen_images)
                     
