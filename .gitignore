@@ -10,3 +10,5 @@ tests
 gradio.sh
 data_example
 sft
+scripts.txt
+data/test_dataloader_outputs/

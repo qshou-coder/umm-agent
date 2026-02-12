@@ -3,6 +3,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
 export NCCL_SOCKET_IFNAME=bond1
 export NCCL_DEBUG=INFO
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
+cd "${PROJECT_ROOT}"
 
 NNODES=$1
 NODE_RANK=$2
@@ -39,4 +43,7 @@ torchrun \
     --max_num_tokens_per_sample 30240 \
     --wandb_project bagel_agent-SFT \
     --wandb_name interleaved_v1_0212 \
-    --wandb_offline False
+    --wandb_offline True
+
+# for debugging
+# bash scripts/train_sft_v1.sh 1 0 28.49.32.176 29501

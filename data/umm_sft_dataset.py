@@ -1,7 +1,6 @@
 # Copyright 2026 Quanxin Shou
 import json
 import os
-import glob
 import traceback
 from pathlib import Path
 from PIL import Image
@@ -39,6 +38,36 @@ class SftAgenticIterableDataset(DistributedIterableDataset):
             shuffle_seed,
         )
         self.set_epoch()
+
+    def _build_generation_index(self, gen_dir, valid_exts):
+        """
+        Build an in-memory index for generation images in one directory.
+        This avoids per-sample glob scans during training.
+        """
+        entries = []
+        try:
+            with os.scandir(gen_dir) as it:
+                for entry in it:
+                    if not entry.is_file():
+                        continue
+                    if os.path.splitext(entry.name)[1].lower() not in valid_exts:
+                        continue
+                    entries.append((entry.name, entry.path))
+        except FileNotFoundError:
+            return {"by_key": {}, "entries": []}
+
+        entries.sort(key=lambda x: x[0])
+
+        by_key = {}
+        for filename, path in entries:
+            stem = os.path.splitext(filename)[0]
+            keys = {stem}
+            if "_" in stem:
+                keys.add(stem.split("_", 1)[0])
+            for key in keys:
+                by_key.setdefault(key, []).append(path)
+
+        return {"by_key": by_key, "entries": entries}
         
     def get_data_paths(
         self, json_path_list, reference_list, generation_list, 
@@ -159,12 +188,17 @@ class SftAgenticIterableDataset(DistributedIterableDataset):
             f"rank-{self.local_rank} worker-{worker_id} dataset-{self.dataset_name}: "
             f"resuming data at row#{row_start_id}"
         )
+
+        gen_index_by_dir = {}
+        for _, _, gen_dir in data_paths_per_worker:
+            if gen_dir not in gen_index_by_dir:
+                gen_index_by_dir[gen_dir] = self._build_generation_index(gen_dir, valid_exts)
         
         while True:
             data_paths_per_worker_ = data_paths_per_worker[row_start_id:]
             for row_id, (data_item, ref_dir, gen_dir) in enumerate(data_paths_per_worker_, start=row_start_id):
                 try:
-                    ip_index = data_item["ip_index"]
+                    ip_index = str(data_item["ip_index"])
                     
                     ref_image_dir = os.path.join(ref_dir, ip_index)
                     if not os.path.exists(ref_image_dir):
@@ -172,9 +206,17 @@ class SftAgenticIterableDataset(DistributedIterableDataset):
                     
                     ref_list = sorted([str(p) for p in Path(ref_image_dir).iterdir() 
                                         if p.suffix.lower() in valid_exts])[:2]
-                    
-                    possible_gen = glob.glob(os.path.join(gen_dir, f"{ip_index}*"))
-                    gen_list = [f for f in possible_gen if os.path.splitext(f)[1].lower() in valid_exts][:1]
+
+                    gen_index = gen_index_by_dir.get(gen_dir, {"by_key": {}, "entries": []})
+                    gen_candidates = list(gen_index["by_key"].get(ip_index, []))
+                    if len(gen_candidates) == 0:
+                        # Compatibility fallback for names that still use ip prefix but
+                        # do not follow "<ip>_xxx.ext" naming.
+                        gen_candidates = [
+                            path for filename, path in gen_index["entries"]
+                            if os.path.splitext(filename)[0].startswith(ip_index)
+                        ]
+                    gen_list = gen_candidates[:1]
 
                     if len(ref_list) != 2 or len(gen_list) != 1:
                         continue

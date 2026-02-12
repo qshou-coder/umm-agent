@@ -418,21 +418,27 @@ def main():
             training_args.peak_device_tflops = auto_tflops
 
     # Setup logging:
+    use_wandb = False
     if dist.get_rank() == 0:
         os.makedirs(training_args.results_dir, exist_ok=True)
         os.makedirs(training_args.checkpoint_dir, exist_ok=True)
         logger = create_logger(training_args.results_dir, dist.get_rank())
-        wandb.init(
-            project=training_args.wandb_project, 
-            id=f"{training_args.wandb_name}-run{training_args.wandb_runid}", 
-            name=training_args.wandb_name, 
-            resume=training_args.wandb_resume,
-            mode="offline" if training_args.wandb_offline else "online",
-            settings=wandb.Settings(init_timeout=120)
-        )
-        wandb.config.update(training_args)
-        wandb.config.update(model_args)
-        wandb.config.update(data_args)
+        try:
+            wandb.init(
+                project=training_args.wandb_project,
+                id=f"{training_args.wandb_name}-run{training_args.wandb_runid}",
+                name=training_args.wandb_name,
+                resume=training_args.wandb_resume,
+                mode="offline" if training_args.wandb_offline else "online",
+                settings=wandb.Settings(init_timeout=120)
+            )
+            wandb.config.update(training_args)
+            wandb.config.update(model_args)
+            wandb.config.update(data_args)
+            use_wandb = True
+        except Exception as e:
+            # Keep training alive if W&B auth/network is unavailable.
+            logger.warning(f"W&B init failed, continue without W&B: {e}")
         if training_args.peak_device_tflops > 0:
             logger.info(f"Using peak_device_tflops={training_args.peak_device_tflops:.2f} TFLOPs (per GPU).")
         else:
@@ -780,7 +786,7 @@ def main():
             dist.all_reduce(mem_cache, op=dist.ReduceOp.MAX)
             wandb_log['mem_cache'] = mem_cache
 
-            if dist.get_rank() == 0:
+            if dist.get_rank() == 0 and use_wandb:
                 wandb.log(wandb_log, step=curr_step)
             start_time = time()
             token_window = 0.0
@@ -867,7 +873,7 @@ def main():
         logger.info(f"Final checkpoint saved at step {curr_step}")
     
     logger.info("Done!")
-    if dist.get_rank() == 0:
+    if dist.get_rank() == 0 and use_wandb:
         wandb.finish()
     dist.destroy_process_group()
 
