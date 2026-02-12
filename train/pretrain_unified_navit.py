@@ -104,6 +104,8 @@ print("[debug-train-import] project imports done", flush=True)
 
 
 _ACTIVE_TRAIN_LOADER_ITER = None
+_ACTIVE_LOGGER = None
+_WANDB_ACTIVE = False
 
 
 def _dbg(msg: str):
@@ -254,24 +256,36 @@ def _shutdown_dataloader_workers(logger=None):
 
 
 def _cleanup_runtime(logger=None):
-    _shutdown_dataloader_workers(logger)
+    global _WANDB_ACTIVE
+    active_logger = logger if logger is not None else _ACTIVE_LOGGER
+    if _WANDB_ACTIVE:
+        try:
+            if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
+                wandb.finish()
+            _WANDB_ACTIVE = False
+        except Exception as e:
+            _dbg(f"[cleanup] wandb finish failed: {e}")
+            if active_logger is not None:
+                active_logger.warning(f"[cleanup] wandb finish failed: {e}")
+    _shutdown_dataloader_workers(active_logger)
     if dist.is_available() and dist.is_initialized():
         try:
             dist.destroy_process_group()
             _dbg("[cleanup] process group destroyed")
-            if logger is not None:
-                logger.info("[cleanup] process group destroyed")
+            if active_logger is not None:
+                active_logger.info("[cleanup] process group destroyed")
         except Exception as e:
             _dbg(f"[cleanup] destroy_process_group failed: {e}")
-            if logger is not None:
-                logger.warning(f"[cleanup] destroy_process_group failed: {e}")
+            if active_logger is not None:
+                active_logger.warning(f"[cleanup] destroy_process_group failed: {e}")
 
 
 def _install_termination_handlers(logger=None):
     def _handle_signal(signum, _frame):
-        _dbg(f"[cleanup] received signal={signum}, start cleanup")
-        _cleanup_runtime(logger)
-        raise SystemExit(128 + signum)
+        _dbg(f"[cleanup] received signal={signum}, request graceful shutdown")
+        if logger is not None:
+            logger.warning(f"[cleanup] received signal={signum}, request graceful shutdown")
+        raise KeyboardInterrupt()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -505,8 +519,8 @@ class DataArguments:
         metadata={"help": "DataLoader timeout in seconds. 0 means wait forever."}
     )
     multiprocessing_context: Optional[str] = field(
-        default="spawn",
-        metadata={"help": "DataLoader worker start method: spawn/fork/forkserver. Use empty to keep PyTorch default."}
+        default=None,
+        metadata={"help": "DataLoader worker start method: spawn/fork/forkserver. None keeps PyTorch default."}
     )
     max_num_tokens_per_sample: int = field(
         default=16384,
@@ -748,6 +762,8 @@ class TrainingArguments:
 
 
 def main():
+    global _ACTIVE_LOGGER
+    global _WANDB_ACTIVE
     _dbg("entered main()")
     assert torch.cuda.is_available()
     _dbg("before dist.init_process_group")
@@ -783,6 +799,7 @@ def main():
             wandb.config.update(model_args)
             wandb.config.update(data_args)
             use_wandb = True
+            _WANDB_ACTIVE = True
         except Exception as e:
             # Keep training alive if W&B auth/network is unavailable.
             logger.warning(f"W&B init failed, continue without W&B: {e}")
@@ -792,6 +809,7 @@ def main():
             logger.warning("Peak device TFLOPs not set or auto-detected; MFU will report 0.")
     else:
         logger = create_logger(None, dist.get_rank())
+    _ACTIVE_LOGGER = logger
     _install_termination_handlers(logger)
     _sync_stage("post_logger_setup", logger)
     logger.info(f'Training arguments {training_args}')
@@ -1362,9 +1380,15 @@ def main():
     logger.info("Done!")
     if dist.get_rank() == 0 and use_wandb:
         wandb.finish()
+        _WANDB_ACTIVE = False
     _cleanup_runtime(logger)
 
 
 if __name__ == "__main__":
     _dbg("python entry reached (__main__)")
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        _dbg("[cleanup] KeyboardInterrupt received, exiting gracefully")
+    finally:
+        _cleanup_runtime()
