@@ -279,6 +279,8 @@ class SftAgenticIterableDataset(DistributedIterableDataset):
                             "data_indexes": row_id,
                             "worker_id": worker_id,
                             "dataset_name": self.dataset_name,
+                            "reference_images": ref_list,
+                            "generation_images": gen_list,
                         }
                     )
                 except Exception:

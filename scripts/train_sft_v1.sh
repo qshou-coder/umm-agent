@@ -8,6 +8,14 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
 cd "${PROJECT_ROOT}"
 
+# W&B input logging controls
+WANDB_LOG_INPUT_DATA=${WANDB_LOG_INPUT_DATA:-True}
+WANDB_LOG_INPUT_EVERY=${WANDB_LOG_INPUT_EVERY:-100}
+WANDB_INPUT_PREVIEW_TOKENS=${WANDB_INPUT_PREVIEW_TOKENS:-128}
+WANDB_LOG_INPUT_IMAGES=${WANDB_LOG_INPUT_IMAGES:-True}
+# -1 means log all reference/gen images in the batch
+WANDB_MAX_LOGGED_IMAGES=${WANDB_MAX_LOGGED_IMAGES:--1}
+
 NNODES=$1
 NODE_RANK=$2
 MASTER_ADDR=$3
@@ -43,7 +51,12 @@ torchrun \
     --max_num_tokens_per_sample 30240 \
     --wandb_project bagel_agent-SFT \
     --wandb_name interleaved_v1_0212 \
-    --wandb_offline True
+    --wandb_offline True \
+    --wandb_log_input_data ${WANDB_LOG_INPUT_DATA} \
+    --wandb_log_input_every ${WANDB_LOG_INPUT_EVERY} \
+    --wandb_input_preview_tokens ${WANDB_INPUT_PREVIEW_TOKENS} \
+    --wandb_log_input_images ${WANDB_LOG_INPUT_IMAGES} \
+    --wandb_max_logged_images ${WANDB_MAX_LOGGED_IMAGES}
 
 # for debugging
 # bash scripts/train_sft_v1.sh 1 0 28.49.32.176 29501

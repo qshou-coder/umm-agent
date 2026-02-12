@@ -3,6 +3,7 @@
 
 import functools
 import gc
+import json
 import os
 import wandb
 import yaml
@@ -93,6 +94,74 @@ def detect_peak_tflops(default_tflops: float) -> float:
     else:
         tflops = default_tflops
     return tflops
+
+
+def build_wandb_input_log(
+    data,
+    data_indexes,
+    tokenizer,
+    max_preview_tokens=128,
+    max_preview_chars=800,
+    max_index_items=8,
+    log_images=False,
+    max_logged_images=-1,
+):
+    """
+    Build a compact input snapshot for W&B logging.
+    Keep this lightweight to avoid affecting training throughput.
+    """
+    sample_lens = data.get("sample_lens", [])
+    input_log = {
+        "input/sequence_length": int(data.get("sequence_length", 0)),
+        "input/num_samples_in_batch": int(len(sample_lens)),
+        "input/num_text_tokens": int(data["packed_text_ids"].numel()) if "packed_text_ids" in data else 0,
+        "input/num_vit_tokens": int(data["packed_vit_token_indexes"].numel()) if "packed_vit_token_indexes" in data else 0,
+        "input/num_vae_tokens": int(data["packed_vae_token_indexes"].numel()) if "packed_vae_token_indexes" in data else 0,
+    }
+
+    if len(sample_lens) > 0:
+        input_log["input/sample_len_min"] = int(min(sample_lens))
+        input_log["input/sample_len_max"] = int(max(sample_lens))
+        input_log["input/sample_len_avg"] = float(sum(sample_lens) / len(sample_lens))
+
+    if data_indexes:
+        dataset_counter = {}
+        reference_images = []
+        generation_images = []
+        for item in data_indexes:
+            dataset_name = item.get("dataset_name", "unknown")
+            dataset_counter[dataset_name] = dataset_counter.get(dataset_name, 0) + 1
+            reference_images.extend(item.get("reference_images", []))
+            generation_images.extend(item.get("generation_images", []))
+        input_log["input/dataset_mix"] = json.dumps(dataset_counter, ensure_ascii=False)
+        input_log["input/data_indexes_preview"] = json.dumps(
+            data_indexes[:max_index_items], ensure_ascii=False
+        )
+        if log_images:
+            if max_logged_images > 0:
+                reference_images = reference_images[:max_logged_images]
+                generation_images = generation_images[:max_logged_images]
+            if reference_images:
+                input_log["input/reference_images"] = [
+                    wandb.Image(img_path, caption=os.path.basename(img_path))
+                    for img_path in reference_images
+                ]
+            if generation_images:
+                input_log["input/generation_images"] = [
+                    wandb.Image(img_path, caption=os.path.basename(img_path))
+                    for img_path in generation_images
+                ]
+
+    try:
+        if "packed_text_ids" in data and tokenizer is not None:
+            token_ids = data["packed_text_ids"][:max_preview_tokens].detach().cpu().tolist()
+            preview_text = tokenizer.decode(token_ids, skip_special_tokens=False)
+            input_log["input/text_preview"] = preview_text[:max_preview_chars]
+    except Exception:
+        # Never let preview logging affect training.
+        pass
+
+    return input_log
 
 
 @dataclass
@@ -248,6 +317,26 @@ class TrainingArguments:
     wandb_offline: bool = field(
         default=False,
         metadata={"help": "Run W&B in offline mode (logs locally, sync later)."}
+    )
+    wandb_log_input_data: bool = field(
+        default=False,
+        metadata={"help": "Log a compact snapshot of model input data to W&B."}
+    )
+    wandb_log_input_every: int = field(
+        default=200,
+        metadata={"help": "Log input snapshot every N steps when wandb_log_input_data=True."}
+    )
+    wandb_input_preview_tokens: int = field(
+        default=128,
+        metadata={"help": "Number of packed text tokens to decode for input preview."}
+    )
+    wandb_log_input_images: bool = field(
+        default=False,
+        metadata={"help": "Log reference/gen images from input batch to W&B."}
+    )
+    wandb_max_logged_images: int = field(
+        default=-1,
+        metadata={"help": "Max number of images per type to log; -1 means log all."}
     )
 
     # --- reproducibility & resume ---
@@ -677,6 +766,21 @@ def main():
         data = data.cuda(device).to_dict()
         data_indexes = data.pop('batch_data_indexes', None)
         ce_loss_weights = data.pop('ce_loss_weights', None)       
+        if (
+            dist.get_rank() == 0
+            and use_wandb
+            and training_args.wandb_log_input_data
+            and curr_step % training_args.wandb_log_input_every == 0
+        ):
+            wandb_input_log = build_wandb_input_log(
+                data=data,
+                data_indexes=data_indexes,
+                tokenizer=tokenizer,
+                max_preview_tokens=training_args.wandb_input_preview_tokens,
+                log_images=training_args.wandb_log_input_images,
+                max_logged_images=training_args.wandb_max_logged_images,
+            )
+            wandb.log(wandb_input_log, step=curr_step)
         tokens_tensor = torch.tensor(float(data['sequence_length']), device=device)
         dist.all_reduce(tokens_tensor, op=dist.ReduceOp.SUM)
         token_window += tokens_tensor.item()
