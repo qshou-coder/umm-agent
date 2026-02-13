@@ -8,11 +8,15 @@ import os
 import socket
 import signal
 import importlib
+import sys
+import threading
+import traceback
 from itertools import chain
 import wandb
 import yaml
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import timedelta
 from time import time
 from typing import Optional
 
@@ -110,6 +114,12 @@ _WANDB_ACTIVE = False
 
 def _dbg(msg: str):
     print(f"[debug-train] {msg}", flush=True)
+
+
+def _wandb_token_metric_key(token: str) -> str:
+    token_key = token.replace("<", "").replace(">", "").replace("/", "close_")
+    token_key = token_key.replace("|", "_").strip("_")
+    return f"special_token_loss/{token_key}"
 
 
 def _local_rank() -> int:
@@ -289,6 +299,89 @@ def _install_termination_handlers(logger=None):
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+
+
+def _start_init_watchdog(timeout_sec: int):
+    """
+    Guard against hard hangs inside dist.init_process_group.
+    If timeout is reached before being stopped, force exit with code 75 so elastic can restart.
+    """
+    stop_event = threading.Event()
+
+    # region agent log
+    _agent_log(
+        "H12",
+        "train/pretrain_unified_navit.py:init-watchdog",
+        "init_watchdog_start",
+        {
+            "timeout_sec": int(timeout_sec),
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "env_rank": os.environ.get("RANK"),
+            "env_local_rank": os.environ.get("LOCAL_RANK"),
+            "env_world_size": os.environ.get("WORLD_SIZE"),
+            "elastic_restart_count": _elastic_restart_count(),
+        },
+    )
+    # endregion
+
+    def _watch():
+        if stop_event.wait(timeout=max(1, int(timeout_sec))):
+            return
+        # region agent log
+        _agent_log(
+            "H12",
+            "train/pretrain_unified_navit.py:init-watchdog",
+            "init_watchdog_timeout",
+            {
+                "timeout_sec": int(timeout_sec),
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "env_rank": os.environ.get("RANK"),
+                "env_local_rank": os.environ.get("LOCAL_RANK"),
+                "env_world_size": os.environ.get("WORLD_SIZE"),
+                "elastic_restart_count": _elastic_restart_count(),
+                "exit_code": 75,
+            },
+        )
+        # endregion
+        os._exit(75)
+
+    th = threading.Thread(target=_watch, name="dist-init-watchdog", daemon=True)
+    th.start()
+    return stop_event
+
+
+def _classify_recoverable_exception(exc: Exception) -> tuple[bool, str]:
+    """Classify whether a distributed failure is safe to auto-restart."""
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    recoverable_patterns = (
+        "timeout",
+        "timed out",
+        "rendezvous",
+        "tcpstore",
+        "broken pipe",
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "socket",
+        "nccl",
+        "collective",
+        "allreduce",
+        "barrier",
+        "watchdog",
+    )
+    for pat in recoverable_patterns:
+        if pat in msg:
+            return True, pat
+    return False, "non_recoverable"
+
+
+def _elastic_restart_count() -> int:
+    try:
+        return int(os.environ.get("TORCHELASTIC_RESTART_COUNT", "0"))
+    except ValueError:
+        return -1
 
 
 def count_parameters(module: torch.nn.Module) -> int:
@@ -507,7 +600,7 @@ class DataArguments:
         metadata={"help": "Number of background workers for the PyTorch DataLoader."}
     )
     pin_memory: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Pin CPU memory for faster H2D copy; disable for stability when debugging large clusters."}
     )
     persistent_workers: bool = field(
@@ -764,10 +857,104 @@ class TrainingArguments:
 def main():
     global _ACTIVE_LOGGER
     global _WANDB_ACTIVE
+    # region agent log
+    _agent_log(
+        "H12",
+        "train/pretrain_unified_navit.py:main",
+        "main_enter",
+        {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "env_rank": os.environ.get("RANK"),
+            "env_local_rank": os.environ.get("LOCAL_RANK"),
+            "env_world_size": os.environ.get("WORLD_SIZE"),
+            "elastic_restart_count": _elastic_restart_count(),
+        },
+    )
+    # endregion
     _dbg("entered main()")
+    # region agent log
+    _agent_log(
+        "H12",
+        "train/pretrain_unified_navit.py:main",
+        "before_assert_cuda_available",
+        {
+            "cuda_available": bool(torch.cuda.is_available()),
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "env_rank": os.environ.get("RANK"),
+            "env_local_rank": os.environ.get("LOCAL_RANK"),
+            "env_world_size": os.environ.get("WORLD_SIZE"),
+            "elastic_restart_count": _elastic_restart_count(),
+        },
+    )
+    # endregion
     assert torch.cuda.is_available()
     _dbg("before dist.init_process_group")
-    dist.init_process_group("nccl")
+    # region agent log
+    _agent_log(
+        "H12",
+        "train/pretrain_unified_navit.py:main",
+        "before_init_process_group",
+        {
+            "backend": "nccl",
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "env_rank": os.environ.get("RANK"),
+            "env_local_rank": os.environ.get("LOCAL_RANK"),
+            "env_world_size": os.environ.get("WORLD_SIZE"),
+            "env_master_addr": os.environ.get("MASTER_ADDR"),
+            "env_master_port": os.environ.get("MASTER_PORT"),
+            "elastic_restart_count": _elastic_restart_count(),
+        },
+    )
+    # endregion
+    dist_init_timeout_sec = int(os.environ.get("DIST_INIT_TIMEOUT_SEC", "180"))
+    watchdog_grace_sec = int(os.environ.get("DIST_INIT_WATCHDOG_GRACE_SEC", "30"))
+    watchdog_stop_event = _start_init_watchdog(dist_init_timeout_sec + watchdog_grace_sec)
+    try:
+        dist.init_process_group("nccl", timeout=timedelta(seconds=dist_init_timeout_sec))
+    except Exception as e:
+        # region agent log
+        _agent_log(
+            "H12",
+            "train/pretrain_unified_navit.py:main",
+            "init_process_group_exception",
+            {
+                "backend": "nccl",
+                "timeout_sec": dist_init_timeout_sec,
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "env_rank": os.environ.get("RANK"),
+                "env_local_rank": os.environ.get("LOCAL_RANK"),
+                "env_world_size": os.environ.get("WORLD_SIZE"),
+                "env_master_addr": os.environ.get("MASTER_ADDR"),
+                "env_master_port": os.environ.get("MASTER_PORT"),
+                "elastic_restart_count": _elastic_restart_count(),
+                "error_type": type(e).__name__,
+                "error": str(e),
+            },
+        )
+        # endregion
+        raise
+    finally:
+        watchdog_stop_event.set()
+    # region agent log
+    _agent_log(
+        "H12",
+        "train/pretrain_unified_navit.py:main",
+        "after_init_process_group",
+        {
+            "rank": dist.get_rank(),
+            "world_size": dist.get_world_size(),
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "env_rank": os.environ.get("RANK"),
+            "env_local_rank": os.environ.get("LOCAL_RANK"),
+            "elastic_restart_count": _elastic_restart_count(),
+        },
+    )
+    # endregion
     _dbg(f"dist.init_process_group done, rank={dist.get_rank()}, world_size={dist.get_world_size()}")
     device = dist.get_rank() % torch.cuda.device_count()
     torch.cuda.set_device(device)
@@ -1007,6 +1194,19 @@ def main():
         model.language_model.resize_token_embeddings(len(tokenizer))
         model.config.llm_config.vocab_size = len(tokenizer)
         model.language_model.config.vocab_size = len(tokenizer)
+    tracked_special_tokens = (
+        "<think>",
+        "</think>",
+        "<tool_call>",
+        "</tool_call>",
+        "<recaption>",
+        "</recaption>",
+    )
+    tracked_special_token_ids = {}
+    for token in tracked_special_tokens:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is not None and token_id >= 0:
+            tracked_special_token_ids[token] = token_id
 
     # maybe freeze something:
     if training_args.freeze_vae and training_args.visual_gen:
@@ -1135,6 +1335,14 @@ def main():
         local_elapsed_sec=time() - dataloader_setup_t0,
         topk=16,
     )
+    # region agent log
+    _agent_log(
+        "D1",
+        "train/pretrain_unified_navit.py:step0",
+        "after_post_dataloader_setup",
+        {"rank": dist.get_rank(), "world_size": dist.get_world_size()},
+    )
+    # endregion
 
     # Prepare models for training:
     if training_args.visual_gen:
@@ -1150,10 +1358,42 @@ def main():
     token_window = 0.0
     seqlen_square_window = 0.0
     dense_token_factor, attn_factor = qwen2_flop_coefficients(model.language_model.config)
+    # region agent log
+    _agent_log(
+        "D2",
+        "train/pretrain_unified_navit.py:step0",
+        "before_train_loader_iter",
+        {"rank": dist.get_rank()},
+    )
+    # endregion
     train_loader_iter = iter(train_loader)
+    # region agent log
+    _agent_log(
+        "D2",
+        "train/pretrain_unified_navit.py:step0",
+        "after_train_loader_iter",
+        {"rank": dist.get_rank()},
+    )
+    # endregion
     global _ACTIVE_TRAIN_LOADER_ITER
     _ACTIVE_TRAIN_LOADER_ITER = train_loader_iter
+    # region agent log
+    _agent_log(
+        "D2",
+        "train/pretrain_unified_navit.py:step0",
+        "before_first_batch_next",
+        {"rank": dist.get_rank()},
+    )
+    # endregion
     first_batch = next(train_loader_iter)
+    # region agent log
+    _agent_log(
+        "D2",
+        "train/pretrain_unified_navit.py:step0",
+        "after_first_batch_next",
+        {"rank": dist.get_rank()},
+    )
+    # endregion
     _dbg(f"rank {dist.get_rank()} first batch fetched from dataloader")
     for micro_step, data in enumerate(chain([first_batch], train_loader_iter)):
         if micro_step == 0:
@@ -1162,9 +1402,48 @@ def main():
         if curr_step >= training_args.total_steps:
             logger.info(f"Reached total_steps={training_args.total_steps}, stopping training.")
             break
-        data = data.cuda(device).to_dict()
+        if micro_step == 0:
+            # region agent log
+            _agent_log(
+                "D6",
+                "train/pretrain_unified_navit.py:step0",
+                "before_cuda_to_dict",
+                {"rank": dist.get_rank(), "device": int(device)},
+            )
+            # endregion
+        try:
+            data = data.cuda(device).to_dict()
+        except Exception as e:
+            # region agent log
+            _agent_log(
+                "D6",
+                "train/pretrain_unified_navit.py:step0",
+                "cuda_to_dict_exception",
+                {
+                    "rank": dist.get_rank(),
+                    "device": int(device),
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+            )
+            # endregion
+            raise
+        if micro_step == 0:
+            # region agent log
+            _agent_log(
+                "D6",
+                "train/pretrain_unified_navit.py:step0",
+                "after_cuda_to_dict",
+                {
+                    "rank": dist.get_rank(),
+                    "has_sequence_length": "sequence_length" in data,
+                    "has_ce_loss_indexes": "ce_loss_indexes" in data,
+                },
+            )
+            # endregion
         data_indexes = data.pop('batch_data_indexes', None)
         ce_loss_weights = data.pop('ce_loss_weights', None)       
+        tracked_special_token_stats = {}
         if (
             dist.get_rank() == 0
             and use_wandb
@@ -1181,14 +1460,50 @@ def main():
             )
             wandb.log(wandb_input_log, step=curr_step)
         tokens_tensor = torch.tensor(float(data['sequence_length']), device=device)
+        if micro_step == 0:
+            # region agent log
+            _agent_log(
+                "D3",
+                "train/pretrain_unified_navit.py:step0",
+                "before_tokens_all_reduce",
+                {"rank": dist.get_rank(), "tokens": float(tokens_tensor.item())},
+            )
+            # endregion
         dist.all_reduce(tokens_tensor, op=dist.ReduceOp.SUM)
+        if micro_step == 0:
+            # region agent log
+            _agent_log(
+                "D3",
+                "train/pretrain_unified_navit.py:step0",
+                "after_tokens_all_reduce",
+                {"rank": dist.get_rank(), "tokens_sum": float(tokens_tensor.item())},
+            )
+            # endregion
         token_window += tokens_tensor.item()
         if data['sample_lens']:
             sample_lens_tensor = torch.tensor(data['sample_lens'], dtype=torch.float32, device=device)
             sample_square = torch.dot(sample_lens_tensor, sample_lens_tensor)
         else:
             sample_square = torch.tensor(0.0, dtype=torch.float32, device=device)
+        if micro_step == 0:
+            # region agent log
+            _agent_log(
+                "D4",
+                "train/pretrain_unified_navit.py:step0",
+                "before_sample_square_all_reduce",
+                {"rank": dist.get_rank(), "sample_square": float(sample_square.item())},
+            )
+            # endregion
         dist.all_reduce(sample_square, op=dist.ReduceOp.SUM)
+        if micro_step == 0:
+            # region agent log
+            _agent_log(
+                "D4",
+                "train/pretrain_unified_navit.py:step0",
+                "after_sample_square_all_reduce",
+                {"rank": dist.get_rank(), "sample_square_sum": float(sample_square.item())},
+            )
+            # endregion
         seqlen_square_window += sample_square.item()
 
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
@@ -1196,7 +1511,29 @@ def main():
                 with torch.no_grad():
                     data['padded_latent'] = vae_model.encode(data.pop('padded_images'))
             try:
+                if micro_step == 0:
+                    # region agent log
+                    _agent_log(
+                        "D5",
+                        "train/pretrain_unified_navit.py:step0",
+                        "before_fsdp_forward",
+                        {"rank": dist.get_rank()},
+                    )
+                    # endregion
                 loss_dict = fsdp_model(**data)
+                if micro_step == 0:
+                    # region agent log
+                    _agent_log(
+                        "D5",
+                        "train/pretrain_unified_navit.py:step0",
+                        "after_fsdp_forward",
+                        {
+                            "rank": dist.get_rank(),
+                            "ce_is_none": loss_dict.get("ce") is None,
+                            "mse_is_none": loss_dict.get("mse") is None,
+                        },
+                    )
+                    # endregion
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     logger.error(f"CUDA OOM at step {curr_step}: {e}")
@@ -1206,6 +1543,26 @@ def main():
         loss = 0
         ce = loss_dict["ce"]
         if ce is not None:
+            should_log_special_token_loss = curr_step % training_args.log_every == 0
+            if should_log_special_token_loss and len(tracked_special_token_ids) > 0:
+                packed_label_ids = data['packed_label_ids']
+                ce_detached = ce.detach()
+                for token, token_id in tracked_special_token_ids.items():
+                    token_mask = packed_label_ids == token_id
+                    token_count = token_mask.sum().to(torch.float32)
+                    token_loss_sum = (
+                        ce_detached[token_mask].sum()
+                        if token_mask.any()
+                        else torch.tensor(0.0, device=device)
+                    )
+                    dist.all_reduce(token_loss_sum, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+                    tracked_special_token_stats[token] = {
+                        "count": token_count.item(),
+                        "loss": (
+                            token_loss_sum / token_count.clamp_min(1.0)
+                        ).item(),
+                    }
             total_ce_tokens = torch.tensor(len(data['ce_loss_indexes']), device=device)
             dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
             if training_args.ce_loss_reweighting:
@@ -1283,6 +1640,10 @@ def main():
             wandb_log['tokens_per_step'] = tokens_per_step
             wandb_log['actual_tflops'] = actual_tflops
             wandb_log['mfu'] = mfu_value
+            for token, token_stats in tracked_special_token_stats.items():
+                token_key = _wandb_token_metric_key(token)
+                wandb_log[token_key] = token_stats["loss"]
+                wandb_log[f"{token_key}_count"] = token_stats["count"]
 
             mem_allocated = torch.tensor(torch.cuda.max_memory_allocated() / 1024**2, device=device)
             dist.all_reduce(mem_allocated, op=dist.ReduceOp.MAX)
@@ -1386,9 +1747,72 @@ def main():
 
 if __name__ == "__main__":
     _dbg("python entry reached (__main__)")
+    # region agent log
+    _agent_log(
+        "H12",
+        "train/pretrain_unified_navit.py:__main__",
+        "__main___entered",
+        {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "env_rank": os.environ.get("RANK"),
+            "env_local_rank": os.environ.get("LOCAL_RANK"),
+            "env_world_size": os.environ.get("WORLD_SIZE"),
+            "elastic_restart_count": _elastic_restart_count(),
+        },
+    )
+    # endregion
+    exit_code = 0
     try:
         main()
     except KeyboardInterrupt:
         _dbg("[cleanup] KeyboardInterrupt received, exiting gracefully")
+        exit_code = 130
+    except Exception as e:
+        err_rank = -1
+        err_world = -1
+        if dist.is_available() and dist.is_initialized():
+            err_rank = dist.get_rank()
+            err_world = dist.get_world_size()
+        else:
+            try:
+                err_rank = int(os.environ.get("RANK", "-1"))
+            except ValueError:
+                err_rank = -1
+            try:
+                err_world = int(os.environ.get("WORLD_SIZE", "-1"))
+            except ValueError:
+                err_world = -1
+        is_recoverable, reason = _classify_recoverable_exception(e)
+        exit_code = 75 if is_recoverable else 1
+        # region agent log
+        _agent_log(
+            "HERR",
+            "train/pretrain_unified_navit.py:__main__",
+            "unhandled_exception",
+            {
+                "rank": err_rank,
+                "world_size": err_world,
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "env_rank": os.environ.get("RANK"),
+                "env_local_rank": os.environ.get("LOCAL_RANK"),
+                "env_world_size": os.environ.get("WORLD_SIZE"),
+                "elastic_restart_count": _elastic_restart_count(),
+                "error_type": type(e).__name__,
+                "error": str(e),
+                "recoverable": bool(is_recoverable),
+                "recoverable_reason": reason,
+                "exit_code": exit_code,
+                "traceback": traceback.format_exc(),
+            },
+        )
+        # endregion
+        _dbg(
+            f"[error-policy] recoverable={is_recoverable} reason={reason} "
+            f"exit_code={exit_code}"
+        )
     finally:
         _cleanup_runtime()
+    if exit_code != 0:
+        sys.exit(exit_code)

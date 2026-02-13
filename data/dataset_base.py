@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import os
 import random
 import json
 
 import numpy as np
 import torch
-from .debug_trace import import_with_log
+from .debug_trace import import_with_log, agent_log
 
 _data_utils = import_with_log(
     "data.data_utils",
@@ -583,32 +584,94 @@ class SimpleCustomBatch:
         return self
 
     def cuda(self, device):
+        try:
+            global_rank = int(os.environ.get("RANK", "-1"))
+        except ValueError:
+            global_rank = -1
+        try:
+            local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+        except ValueError:
+            local_rank = -1
+        base_ctx = {
+            "rank": global_rank,
+            "local_rank": local_rank,
+            "device_arg": int(device),
+        }
+        # region agent log
+        agent_log(
+            "D7",
+            "data/dataset_base.py:SimpleCustomBatch.cuda",
+            "cuda_enter",
+            {
+                **base_ctx,
+                "current_cuda_device": int(torch.cuda.current_device()) if torch.cuda.is_available() else -1,
+                "use_flex": bool(self.use_flex),
+                "has_padded_images": hasattr(self, "padded_images"),
+                "has_packed_vit_tokens": hasattr(self, "packed_vit_tokens"),
+                "has_packed_timesteps": hasattr(self, "packed_timesteps"),
+                "has_packed_label_ids": hasattr(self, "packed_label_ids"),
+            },
+        )
+        # endregion
+        # region agent log
+        agent_log("D7", "data/dataset_base.py:SimpleCustomBatch.cuda", "move_text_begin", base_ctx)
+        # endregion
         self.packed_text_ids = self.packed_text_ids.to(device)
         self.packed_text_indexes = self.packed_text_indexes.to(device)
         self.packed_position_ids = self.packed_position_ids.to(device)
+        # region agent log
+        agent_log("D7", "data/dataset_base.py:SimpleCustomBatch.cuda", "move_text_end", base_ctx)
+        # endregion
 
         if not self.use_flex:
+            # region agent log
+            agent_log("D7", "data/dataset_base.py:SimpleCustomBatch.cuda", "move_attention_begin", {**base_ctx, "nested_attention_masks": len(self.nested_attention_masks)})
+            # endregion
             self.nested_attention_masks = [item.to(device) for item in self.nested_attention_masks]
+            # region agent log
+            agent_log("D7", "data/dataset_base.py:SimpleCustomBatch.cuda", "move_attention_end", {**base_ctx, "nested_attention_masks": len(self.nested_attention_masks)})
+            # endregion
 
         if hasattr(self, 'padded_images'):
+            # region agent log
+            agent_log("D7", "data/dataset_base.py:SimpleCustomBatch.cuda", "move_vae_begin", base_ctx)
+            # endregion
             self.padded_images = self.padded_images.to(device)
             self.packed_vae_token_indexes = self.packed_vae_token_indexes.to(device)
             self.packed_latent_position_ids = self.packed_latent_position_ids.to(device)
+            # region agent log
+            agent_log("D7", "data/dataset_base.py:SimpleCustomBatch.cuda", "move_vae_end", base_ctx)
+            # endregion
 
         if hasattr(self, 'packed_timesteps'):
             self.packed_timesteps = self.packed_timesteps.to(device)
             self.mse_loss_indexes = self.mse_loss_indexes.to(device)
 
         if hasattr(self, 'packed_vit_tokens'):
+            # region agent log
+            agent_log("D7", "data/dataset_base.py:SimpleCustomBatch.cuda", "move_vit_begin", base_ctx)
+            # endregion
             self.packed_vit_tokens = self.packed_vit_tokens.to(device)
             self.packed_vit_position_ids = self.packed_vit_position_ids.to(device)
             self.packed_vit_token_indexes = self.packed_vit_token_indexes.to(device)
             self.vit_token_seqlens = self.vit_token_seqlens.to(device)
+            # region agent log
+            agent_log("D7", "data/dataset_base.py:SimpleCustomBatch.cuda", "move_vit_end", base_ctx)
+            # endregion
 
         if hasattr(self, 'packed_label_ids'):
+            # region agent log
+            agent_log("D7", "data/dataset_base.py:SimpleCustomBatch.cuda", "move_label_begin", base_ctx)
+            # endregion
             self.packed_label_ids = self.packed_label_ids.to(device)
             self.ce_loss_indexes = self.ce_loss_indexes.to(device)
             self.ce_loss_weights = self.ce_loss_weights.to(device)
+            # region agent log
+            agent_log("D7", "data/dataset_base.py:SimpleCustomBatch.cuda", "move_label_end", base_ctx)
+            # endregion
+        # region agent log
+        agent_log("D7", "data/dataset_base.py:SimpleCustomBatch.cuda", "cuda_exit", base_ctx)
+        # endregion
 
         return self
 

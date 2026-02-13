@@ -128,28 +128,47 @@ def pil_img2rgb(image):
 
 
 def add_special_tokens(tokenizer):
-    all_special_tokens = []
-    for k, v in tokenizer.special_tokens_map.items():
-        if isinstance(v, str):
-            all_special_tokens.append(v)
-        elif isinstance(v, list):
-            all_special_tokens += v
+    # Core control tokens used by Bagel training/inference.
+    core_tokens = [
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|vision_start|>",
+        "<|vision_end|>",
+    ]
+    # Structured tags observed in trajectory jsons.
+    traj_tokens = [
+        "<tools>",
+        "</tools>",
+        "<observation>",
+        "</observation>",
+        "<tool_call>",
+        "</tool_call>",
+        "<think>",
+        "</think>",
+        "<recaption>",
+        "</recaption>",
+    ]
 
-    new_tokens = []
+    extra_tokens = []
+    existing_additional = tokenizer.special_tokens_map.get("additional_special_tokens", [])
+    if isinstance(existing_additional, str):
+        extra_tokens.append(existing_additional)
+    elif isinstance(existing_additional, list):
+        extra_tokens.extend(existing_additional)
 
-    if '<|im_start|>' not in all_special_tokens:
-        new_tokens.append('<|im_start|>')
+    # Deduplicate while preserving order.
+    merged_tokens = []
+    seen = set()
+    for token in extra_tokens + core_tokens + traj_tokens:
+        if token not in seen:
+            seen.add(token)
+            merged_tokens.append(token)
 
-    if '<|im_end|>' not in all_special_tokens:
-        new_tokens.append('<|im_end|>')
+    # Use add_special_tokens so special_tokens_map is updated consistently.
+    num_new_tokens = tokenizer.add_special_tokens(
+        {"additional_special_tokens": merged_tokens}
+    )
 
-    if '<|vision_start|>' not in all_special_tokens:
-        new_tokens.append('<|vision_start|>')
-
-    if '<|vision_end|>' not in all_special_tokens:
-        new_tokens.append('<|vision_end|>')
-
-    num_new_tokens = tokenizer.add_tokens(new_tokens)
     bos_token_id = tokenizer.convert_tokens_to_ids('<|im_start|>')
     eos_token_id = tokenizer.convert_tokens_to_ids('<|im_end|>')
     start_of_image = tokenizer.convert_tokens_to_ids('<|vision_start|>')

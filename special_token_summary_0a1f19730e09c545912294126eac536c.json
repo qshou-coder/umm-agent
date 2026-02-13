@@ -1,0 +1,41 @@
+{
+  "source_file": "/apdcephfs_zwfy2/share_303944931/shawncschen/umm_search_agent/output/animation/traj/0a1f19730e09c545912294126eac536c_trajectory.json",
+  "match_rule": {
+    "description": "Match tag-like special tokens in forms <tag>, </tag>, and ≤tag≥ / ≤/tag≥.",
+    "regex": "</?[A-Za-z_][A-Za-z0-9_:-]*>|≤/?[A-Za-z_][A-Za-z0-9_:-]*≥"
+  },
+  "note": [
+    "No token in ≤think≥ form was found in this file.",
+    "Actual think tags are in <think> / </think> form."
+  ],
+  "all_fields_stats": {
+    "total_matches": 84,
+    "token_counts": {
+      "<recaption>": 18,
+      "<tool_call>": 16,
+      "</tool_call>": 16,
+      "<think>": 10,
+      "</think>": 6,
+      "</recaption>": 6,
+      "<observation>": 4,
+      "</observation>": 4,
+      "<tools>": 2,
+      "</tools>": 2
+    }
+  },
+  "turns_only_stats": {
+    "total_matches": 50,
+    "token_counts": {
+      "<recaption>": 10,
+      "<tool_call>": 10,
+      "</tool_call>": 10,
+      "<think>": 6,
+      "</think>": 4,
+      "</recaption>": 4,
+      "<observation>": 2,
+      "</observation>": 2,
+      "<tools>": 1,
+      "</tools>": 1
+    }
+  }
+}
